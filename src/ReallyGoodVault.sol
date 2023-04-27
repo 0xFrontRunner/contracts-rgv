@@ -14,6 +14,7 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
 
     uint16 public WITHDRAW_FEE;
     uint16 public MANAGEMENT_FEE;
+    uint256 public minDeposit;
     State public vaultState;
     uint256 public totalAssetSnapshot;
     address public feeDistributor;
@@ -28,7 +29,8 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
         uint16 _withdrawFee,
         uint16 _managementFee,
         address _owner,
-        address _feeDistributor
+        address _feeDistributor,
+        uint256 _minDeposit,
     ) ERC4626(_asset, _name, _symbol) Owned(_owner) {
         if (address(_asset) == address(0)) {
             revert InvalidAddress();
@@ -270,7 +272,13 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
         address _contract,
         bool _whitelisted
     ) external onlyOwner {
+        if (_contract == address(0)) revert InvalidAddress();
         whitelistedContract[_contract] = _whitelisted;
+    }
+
+    function setMinAmount(uint256 _minAmount) external onlyOwner {
+        if (_minAmount == 0) revert ZeroAmount();
+        minAmount = _minAmount;
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -288,10 +296,10 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
     }
 
     function generateWithdrawalId(
-        address r,
-        uint256 a,
-        uint256 s,
-        uint256 t
+        address r, // recipient
+        uint256 a, // amount
+        uint256 s, // shares
+        uint256 t // timestamp
     ) public pure returns (uint256 id) {
         id = uint256(keccak256(abi.encodePacked(r, a, s, t)));
     }
@@ -310,12 +318,14 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
 
     function afterDeposit(uint256 amount, uint256) internal override {
         // Do something after depositing
+        if(amount < minDeposit) revert AmountTooSmall();
         asset.safeTransferFrom(address(this), owner, amount);
     }
 
     function beforeWithdraw(uint256, uint256) internal view override {
         // Do something before withdrawing
         if (vaultState == State.PROCESSING) revert Paused();
+        if(amount < minDeposit) revert AmountTooSmall();
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -365,4 +375,5 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
     error InvalidState();
     error WithdrawalsPending();
     error ContractNotWhitelisted();
+    error AmountTooSmall();
 }
