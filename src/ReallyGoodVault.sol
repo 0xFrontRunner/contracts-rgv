@@ -185,16 +185,19 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
         uint256 profit = totalAssetSnapshot < _totalAssets
             ? _totalAssets - totalAssetSnapshot
             : 0;
-        if (profit > 0) _chargeManagementFee(profit);
+        uint256 mFee;
+        if (profit > 0) mFee = _chargeManagementFee(profit);
         // set new value of shares after management fee
-        totalAssetSnapshot = _totalAssets;
+        totalAssetSnapshot = _totalAssets - mFee;
         // allow deposits and withdrawals again
         vaultState = State.OPEN;
     }
 
-    function _chargeManagementFee(uint256 amount) internal {
+    function _chargeManagementFee(
+        uint256 amount
+    ) internal returns (uint256 fee) {
         // 0.5% = multiply by 10000 then divide by 50
-        uint256 fee = amount.mulDivDown(MANAGEMENT_FEE, 10000);
+        fee = amount.mulDivDown(MANAGEMENT_FEE, 10000);
         if (fee > 0) {
             asset.safeTransferFrom(msg.sender, feeDistributor, fee);
         }
