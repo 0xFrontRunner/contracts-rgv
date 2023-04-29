@@ -6,7 +6,6 @@ contract Queue {
     struct WithdrawalItem {
         address recipient;
         uint256 shares;
-        uint256 amount;
         uint256 timestamp;
     }
 
@@ -14,8 +13,8 @@ contract Queue {
     WithdrawalItem[] public withdrawals;
 
     // Declare and initialize the front and rear indices
-    uint256 internal front = 0;
-    uint256 internal rear = 0;
+    uint256 public front = 0;
+    uint256 public rear = 0;
 
     // Function to add an element to the queue
     function enqueue(WithdrawalItem memory _item) internal {

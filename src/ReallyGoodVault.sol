@@ -17,7 +17,7 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
     uint256 public minDeposit;
     State public vaultState;
     uint256 public totalAssetSnapshot;
-    address public feeDistributor;
+    address public feeCollector;
 
     mapping(address => uint256) public pendingBalance;
     mapping(address => bool) public whitelistedContract;
@@ -29,8 +29,8 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
         uint16 _withdrawFee,
         uint16 _managementFee,
         address _owner,
-        address _feeDistributor,
-        uint256 _minDeposit,
+        address _feeCollector,
+        uint256 _minDeposit
     ) ERC4626(_asset, _name, _symbol) Owned(_owner) {
         if (address(_asset) == address(0)) {
             revert InvalidAddress();
@@ -40,13 +40,15 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
             revert InvalidAddress();
         }
 
-        if (_feeDistributor == address(0)) {
+        if (_feeCollector == address(0)) {
             revert InvalidAddress();
         }
 
         WITHDRAW_FEE = _withdrawFee;
         MANAGEMENT_FEE = _managementFee;
-        feeDistributor = _feeDistributor;
+        feeCollector = _feeCollector;
+        minDeposit = _minDeposit;
+        vaultState = State.PROCESSING;
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -59,6 +61,7 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
     ) public override nonReentrant returns (uint256 shares) {
         _senderIsEligible();
         if (vaultState == State.PROCESSING) revert Paused();
+        if (assets < minDeposit) revert AmountTooSmall();
 
         // Check for rounding error since we round down in previewDeposit.
         require((shares = previewDeposit(assets)) != 0, "ZERO_SHARES");
@@ -81,6 +84,8 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
         if (vaultState == State.PROCESSING) revert Paused();
 
         assets = previewMint(shares); // No need to check for rounding error, previewMint rounds up.
+
+        if (assets < minDeposit) revert AmountTooSmall();
 
         // Need to transfer before minting or ERC777s could reenter.
         asset.safeTransferFrom(msg.sender, address(this), assets);
@@ -107,11 +112,12 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
         }
 
         beforeWithdraw(assets, shares);
+
         _burn(owner, shares);
 
         _mintPending(owner, shares);
 
-        _queueWithdrawal(owner, receiver, assets, shares);
+        _queueWithdrawal(owner, receiver, shares);
 
         emit Withdraw(msg.sender, receiver, owner, assets, shares);
 
@@ -139,7 +145,7 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
 
         _mintPending(owner, shares);
 
-        _queueWithdrawal(owner, receiver, assets, shares);
+        _queueWithdrawal(owner, receiver, shares);
 
         emit Withdraw(msg.sender, receiver, owner, assets, shares);
 
@@ -149,26 +155,24 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
     function _queueWithdrawal(
         address owner,
         address receiver,
-        uint256 assets,
         uint256 shares
     ) internal {
-        enqueue(WithdrawalItem(receiver, assets, shares, block.timestamp));
+        enqueue(WithdrawalItem(receiver, shares, block.timestamp));
         emit PendingWithdrawal(
             owner,
             receiver,
-            assets,
             shares,
             block.timestamp,
-            generateWithdrawalId(receiver, assets, shares, block.timestamp)
+            generateWithdrawalId(receiver, shares, block.timestamp)
         );
     }
 
-    function _burnPending(address _owner, uint256 _amount) internal {
-        pendingBalance[_owner] -= _amount;
+    function _burnPending(address _owner, uint256 shares) internal {
+        pendingBalance[_owner] -= shares;
     }
 
-    function _mintPending(address _owner, uint256 _amount) internal {
-        pendingBalance[_owner] += _amount;
+    function _mintPending(address _owner, uint256 shares) internal {
+        pendingBalance[_owner] += shares;
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -182,7 +186,6 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
     function setTotalAssets(uint256 _totalAssets) external onlyOwner {
         if (vaultState == State.OPEN) revert InvalidState();
         if (_totalAssets == 0) revert ZeroAmount();
-        if (withdrawalsLenght() > 0) revert WithdrawalsPending();
 
         uint256 profit = totalAssetSnapshot < _totalAssets
             ? _totalAssets - totalAssetSnapshot
@@ -201,7 +204,7 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
         // 0.5% = multiply by 10000 then divide by 50
         fee = amount.mulDivDown(MANAGEMENT_FEE, 10000);
         if (fee > 0) {
-            asset.safeTransferFrom(msg.sender, feeDistributor, fee);
+            asset.safeTransferFrom(msg.sender, feeCollector, fee);
         }
     }
 
@@ -222,7 +225,7 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
 
     function _processWithdrawal(WithdrawalItem memory request) internal {
         _burnPending(request.recipient, request.shares);
-        uint256 amount = _chargeWithdrawFee(request.amount);
+        uint256 amount = _chargeWithdrawFee(convertToAssets(request.shares));
         asset.safeTransferFrom(msg.sender, request.recipient, amount);
         emit Withdrawal(
             request.recipient,
@@ -231,7 +234,6 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
             block.timestamp,
             generateWithdrawalId(
                 request.recipient,
-                request.amount,
                 request.shares,
                 request.timestamp
             )
@@ -242,9 +244,22 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
         // 0.5% = multiply by 10000 then divide by 50
         uint256 fee = amount.mulDivDown(WITHDRAW_FEE, 10000);
         if (fee > 0) {
-            asset.safeTransferFrom(msg.sender, feeDistributor, fee);
+            asset.safeTransferFrom(msg.sender, feeCollector, fee);
         }
         return amount - fee;
+    }
+
+    function initialVaultState(
+        uint256 initialShares,
+        uint256 initialAssets
+    ) external onlyOwner {
+        if (initialShares == 0 || initialAssets == 0) {
+            revert ZeroAmount();
+        }
+        totalSupply = initialAssets;
+        totalAssetSnapshot = initialShares;
+
+        vaultState = State.OPEN;
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -263,12 +278,12 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
         MANAGEMENT_FEE = _managementFee;
     }
 
-    function setFeeDistributor(address _feeDistributor) external onlyOwner {
-        if (_feeDistributor == address(0)) revert InvalidAddress();
-        feeDistributor = _feeDistributor;
+    function setFeeDistributor(address _feeCollector) external onlyOwner {
+        if (_feeCollector == address(0)) revert InvalidAddress();
+        feeCollector = _feeCollector;
     }
 
-    function setWhitelistedContract(
+    function whitelistContract(
         address _contract,
         bool _whitelisted
     ) external onlyOwner {
@@ -276,18 +291,28 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
         whitelistedContract[_contract] = _whitelisted;
     }
 
-    function setMinAmount(uint256 _minAmount) external onlyOwner {
-        if (_minAmount == 0) revert ZeroAmount();
-        minAmount = _minAmount;
+    function setMinAmount(uint256 _minDeposit) external onlyOwner {
+        if (_minDeposit == 0) revert ZeroAmount();
+        minDeposit = _minDeposit;
     }
 
     /*///////////////////////////////////////////////////////////////
                          VIEW-FUNCTIONS
     //////////////////////////////////////////////////////////////*/
 
-    function allOutstandingWithdrawals() external view returns (uint256 sum) {
+    function getOutstandingWithdrawalShares()
+        external
+        view
+        returns (uint256 sum)
+    {
         for (uint256 i = front; i < rear; i++) {
-            sum += withdrawals[i].amount;
+            sum += withdrawals[i].shares;
+        }
+    }
+
+    function previewProcessWithdrawal() external view returns (uint256 sum) {
+        for (uint256 i = front; i < rear; i++) {
+            sum += convertToAssets(withdrawals[i].shares);
         }
     }
 
@@ -297,11 +322,22 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
 
     function generateWithdrawalId(
         address r, // recipient
-        uint256 a, // amount
         uint256 s, // shares
         uint256 t // timestamp
     ) public pure returns (uint256 id) {
-        id = uint256(keccak256(abi.encodePacked(r, a, s, t)));
+        id = uint256(keccak256(abi.encodePacked(r, s, t)));
+    }
+
+    function getWithdrawalItem(
+        uint256 id
+    )
+        external
+        view
+        returns (address recipient, uint256 shares, uint256 timestamp)
+    {
+        shares = withdrawals[id].shares;
+        timestamp = withdrawals[id].timestamp;
+        recipient = withdrawals[id].recipient;
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -318,14 +354,13 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
 
     function afterDeposit(uint256 amount, uint256) internal override {
         // Do something after depositing
-        if(amount < minDeposit) revert AmountTooSmall();
-        asset.safeTransferFrom(address(this), owner, amount);
+        asset.safeTransfer(owner, amount);
     }
 
-    function beforeWithdraw(uint256, uint256) internal view override {
+    function beforeWithdraw(uint256 amount, uint256) internal view override {
         // Do something before withdrawing
         if (vaultState == State.PROCESSING) revert Paused();
-        if(amount < minDeposit) revert AmountTooSmall();
+        if (amount < minDeposit) revert AmountTooSmall();
     }
 
     /*///////////////////////////////////////////////////////////////
@@ -351,14 +386,13 @@ contract ReallyGoodVault is ERC4626, Owned, ReentrancyGuard, Queue {
     event PendingWithdrawal(
         address indexed owner,
         address indexed receiver,
-        uint256 assets,
         uint256 shares,
         uint256 timestamp,
         uint256 id
     );
     event Withdrawal(
         address indexed owner,
-        uint256 amountAfterFee,
+        uint256 assetsAfterFee,
         uint256 shares,
         uint256 executedAt,
         uint256 id
